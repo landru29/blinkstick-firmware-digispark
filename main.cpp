@@ -13,6 +13,13 @@
 #define G_BIT            0
 #define B_BIT            4
 
+#define RED   0
+#define GREEN 1
+#define BLUE  2
+
+#define MAX_LED_ON 5   // maximum number of led light on
+#define MAX_LED    32  // Maximum number of led
+
 
 #include <avr/io.h>
 #include <avr/wdt.h>
@@ -46,24 +53,36 @@ const PROGMEM char usbHidReportDescriptor[USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH] 
     0x15, 0x00,                    //   LOGICAL_MINIMUM (0)
     0x26, 0xff, 0x00,              //   LOGICAL_MAXIMUM (255)
     0x75, 0x08,                    //   REPORT_SIZE (8)
-    0x85, 0x01,                    //   REPORT_ID (1)
+
+    0x85, 0x01,                    //   REPORT_ID (1)      => light on
     0x95, 0x03,                    //   REPORT_COUNT (3)
     0x09, 0x00,                    //   USAGE (Undefined)
     0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+
     0x85, 0x02,                    //   REPORT_ID (2)
     0x95, 0x20,                    //   REPORT_COUNT (32)
     0x09, 0x00,                    //   USAGE (Undefined)
     0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+
     0x85, 0x03,                    //   REPORT_ID (3)
     0x95, 0x20,                    //   REPORT_COUNT (32)
     0x09, 0x00,                    //   USAGE (Undefined)
     0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+
+	0x85, 0x04,                    //   REPORT_ID (4)      => set mode 0:normal, 1: inverse, 2:WS2812
+    0x95, 0x02,                    //   REPORT_COUNT (2)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+
+	0x85, 0x05,                    //   REPORT_ID (5)      => light on, adressing led
+    0x95, 0x05,                    //   REPORT_COUNT (5)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+
     0xc0                           // END_COLLECTION
 };
 
-static volatile uint8_t r = 0;
-static volatile uint8_t g = 0;
-static volatile uint8_t b = 0;
+static volatile uint8_t color[3 * MAX_LED] = {0};
 
 static uchar currentAddress;
 static uchar addressOffset;
@@ -77,7 +96,7 @@ static uchar replyBuffer[33]; //32 for data + 1 for report id
 */
 uchar usbFunctionRead(uchar *data, uchar len)
 {
-	if (reportId == 1)
+	if (reportId == 1 || reportId == 5)
 	{
 		//Not used
 		return 0;
@@ -119,25 +138,65 @@ uchar usbFunctionWrite(uchar *data, uchar len)
 	if (reportId == 1)
 	{
 		//Only send data if the color has changed
-		if (data[1] != r || data[2] != g || data[3] != b)
+		if (data[1] != color[RED] || data[2] != color[GREEN] || data[3] != color[BLUE])
 		{
-			r = data[1];
-			g = data[2];
-			b = data[3];
+			color[RED]   = data[1];
+			color[GREEN] = data[2];
+			color[BLUE ] = data[3];
 
-
-			uint8_t led[3];
-			
-			led[0]=data[2];
-			led[1]=data[1];
-			led[2]=data[3];
+			uint8_t* led = (uint8_t*)color;
 
 			cli(); //Disable interrupts
-			ws2812_sendarray_mask(&led[0], 3, _BV(PB1));
+			ws2812_sendarray_mask(led, 3, _BV(PB1));
 			sei(); //Enable interrupts
 		}
 
 		return 1;
+	}
+	else if (reportId == 5)
+	{
+		//uint8_t pinmask;
+		uint8_t ledIndex = 0;
+		//uint8_t ledsOn = 0;
+		//uint8_t i;
+
+		// prevent from burning 5V regulator
+		/*for (i=0; i<MAX_LED; i++) {
+			if ((color[3*i+RED]) && (color[3*i+GREEN]) && (color[3*i+BLUE])) {
+				if (ledsOn++ > MAX_LED_ON) {
+					return 1;
+				}
+			}
+		}
+
+		// data[2] => index
+		if (data[2] >= MAX_LED) {
+			return 1;
+		}
+		ledIndex = data[2];*/
+
+		// data[1] => channel
+		/*if (data[1] == 0) pinmask = _BV(PB1);
+		if (data[1] == 1) pinmask = _BV(PB2);
+		if (data[1] == 2) pinmask = _BV(PB3);*/
+
+		// data[3] => R
+		color[ledIndex * 3 + RED] = data[3];
+
+		// data[4] => G
+		color[ledIndex * 3 + GREEN] = data[4];
+
+		// data[5] => B
+		color[ledIndex * 3 + BLUE] = data[5];
+
+		uint8_t* led = (uint8_t*)color;
+
+		cli(); //Disable interrupts
+		//ws2812_sendarray_mask(led, 3 * 5, pinmask);
+		ws2812_sendarray_mask(led, 3, _BV(PB1));
+		sei(); //Enable interrupts
+
+		return 1;	
 	}
 	else if (reportId == 2 || reportId == 3)
 	{
@@ -237,9 +296,9 @@ extern "C" usbMsgLen_t usbFunctionSetup(uchar data[8])
 			 if(reportId == 1){ //Device colors
 				 
 				replyBuffer[0] = 1; //report id
-				replyBuffer[1] = r; //255 - OCR1B;
-				replyBuffer[2] = g; //255 - OCR0B;
-				replyBuffer[3] = b; //255 - OCR0A;
+				replyBuffer[1] = color[RED]; //255 - OCR1B;
+				replyBuffer[2] = color[GREEN]; //255 - OCR0B;
+				replyBuffer[3] = color[BLUE]; //255 - OCR0A;
 
 				return 4;
 				 
@@ -264,13 +323,24 @@ extern "C" usbMsgLen_t usbFunctionSetup(uchar data[8])
 
 				 return USB_NO_MSG; /* use usbFunctionRead() to obtain data */
 			 }
+			 else if(reportId == 5){ //Device colors
+				 
+				replyBuffer[0] = 5; //report id
+				replyBuffer[1] = color[RED]; //255 - OCR1B;
+				replyBuffer[2] = color[GREEN]; //255 - OCR0B;
+				replyBuffer[3] = color[BLUE]; //255 - OCR0A;
+
+				return 4;
+				 
+			 }
 
 			 return 0;
 
         }else if(rq->bRequest == USBRQ_HID_SET_REPORT){
 			 if(reportId == 1){ //Device colors
+			    currentAddress = 0;
 				bytesRemaining = 3;
-				currentAddress = 0;
+				
 				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
 			 }
 			 else if(reportId == 2){ // Name of the device
@@ -285,6 +355,12 @@ extern "C" usbMsgLen_t usbFunctionSetup(uchar data[8])
 				bytesRemaining = 32;
 
 				addressOffset = 64;
+				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
+			 } 
+			 else if(reportId == 5){ // Device colors
+				currentAddress = 0;
+				bytesRemaining = 5;
+
 				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
 			 }
 			 return 0;
