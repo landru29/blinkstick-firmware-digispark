@@ -14,13 +14,13 @@ DEVICE  = attiny85
 F_CPU   = 16500000
 FUSE_L  = 0xe1
 FUSE_H  = 0xdd
-AVRDUDE = avrdude -c usbtiny -P usb -p $(DEVICE) # edit this line for your programmer
+AVRDUDE = avrdude -c usbasp -p $(DEVICE) # edit this line for your programmer
 
 CFLAGS  = -Iusbdrv -I. -DDEBUG_LEVEL=0
 OBJECTS = usbdrv/usbdrv.o usbdrv/usbdrvasm.o usbdrv/oddebug.o light_ws2812.o main.o
 
-COMPILE = avr-gcc -Wall -Os -DF_CPU=$(F_CPU)  $(CFLAGS) -mmcu=$(DEVICE)
-COMPILEPP = avr-g++ -Wall -Os -DF_CPU=$(F_CPU)  $(CFLAGS) -mmcu=$(DEVICE)
+COMPILE = avr-gcc -Wall -Os -DF_CPU=$(F_CPU) $(CFLAGS) -mmcu=$(DEVICE)
+COMPILEPP = avr-g++ -Wall -Os -DF_CPU=$(F_CPU) $(CFLAGS) -mmcu=$(DEVICE)
 
 # symbolic targets:
 help:

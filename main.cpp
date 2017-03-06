@@ -13,6 +13,17 @@
 #define G_BIT            0
 #define B_BIT            4
 
+#define R_PWM				OCR1B
+#define G_PWM				OCR0B
+#define B_PWM				OCR0A
+
+#define MODE_RGB			0
+#define MODE_RGB_INVERSE   	1
+#define MODE_WS2812		   	2
+
+#define TASK_NONE			0
+#define TASK_SEND_DATA 		1
+#define TASK_SET_MODE  		2
 
 #include <avr/io.h>
 #include <avr/wdt.h>
@@ -31,6 +42,40 @@ extern "C"
 {
 	#include "light_ws2812.h"
 }
+
+/* ------------------------------------------------------------------------- */
+/* ----------------------------- LED interface ----------------------------- */
+/* ------------------------------------------------------------------------- */
+
+#define MAX_LEDS		64
+#define MIN_LED_FRAME	8 * 3
+#define DELAY_CYCLES	64
+
+static uint8_t led[MAX_LEDS * 3];
+
+const PROGMEM uint16_t ledDataCount[] = {MIN_LED_FRAME, MIN_LED_FRAME * 2, MIN_LED_FRAME * 4, MIN_LED_FRAME * 8 };
+
+/* 
+	Reports:
+		1: LED Data [R, G, B]
+		2: Name [Binary Data 0..32]
+		3: Data [Binary Data 0..32]
+		4: Mode set [MODE]: 0 - RGB LED Strip, 1 - Inverse RGB LED Strip, 2 - WS2812
+		5: LED Data [CHANNEL, INDEX, R, G, B]
+		6: LED Frame [Channel, [G, R, B][0..7]]
+		7: LED Frame [Channel, [G, R, B][0..15]]
+		8: LED Frame [Channel, [G, R, B][0..31]]
+		9: LED Frame [Channel, [G, R, B][0..63]]
+	
+	Memory Map:
+		00      : Oscillator calibration value
+		01 - 0C : Serial
+		0D      : Mode
+		0F - 1F : <unused>
+		20 - 3F : Name
+		40 - 5F : Data
+		60 -    : <unused>
+*/
 
 /* ------------------------------------------------------------------------- */
 /* ----------------------------- USB interface ----------------------------- */
@@ -58,6 +103,30 @@ const PROGMEM char usbHidReportDescriptor[USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH] 
     0x95, 0x20,                    //   REPORT_COUNT (32)
     0x09, 0x00,                    //   USAGE (Undefined)
     0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x04,                    //   REPORT_ID (4)
+    0x95, 0x01,                    //   REPORT_COUNT (1)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x05,                    //   REPORT_ID (5)
+    0x95, 0x05,                    //   REPORT_COUNT (5)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x06,                    //   REPORT_ID (6)
+    0x95, MIN_LED_FRAME + 1,       //   REPORT_COUNT (25)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x07,                    //   REPORT_ID (7)
+    0x95, MIN_LED_FRAME * 2 + 1,   //   REPORT_COUNT (49)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x08,                    //   REPORT_ID (8)
+    0x95, MIN_LED_FRAME * 4 + 1,   //   REPORT_COUNT (97)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
+    0x85, 0x09,                    //   REPORT_ID (9)
+    0x95, MIN_LED_FRAME * 8 + 1,   //   REPORT_COUNT (193)
+    0x09, 0x00,                    //   USAGE (Undefined)
+    0xb2, 0x02, 0x01,              //   FEATURE (Data,Var,Abs,Buf)
     0xc0                           // END_COLLECTION
 };
 
@@ -69,8 +138,45 @@ static uchar currentAddress;
 static uchar addressOffset;
 static uchar bytesRemaining;
 static uchar reportId = 0; 
+static uchar channel;
 
-static uchar replyBuffer[33]; //32 for data + 1 for report id
+static uint8_t mode;
+static uint8_t task = 0;
+static uint16_t ledCount = 0;
+static uint16_t ledIndex = 0;
+static uint16_t delayCycles = 0;
+
+//static uchar replyBuffer[33]; //32 for data + 1 for report id
+
+/* ------------------------------------------------------------------------- */
+/* ----------------------------- Helper Functions--------------------------- */
+/* ------------------------------------------------------------------------- */
+
+uchar channelToPin(uchar ch) {
+	if (ch == 1) //G
+	{
+		return _BV(G_BIT);
+	}
+	else if (ch == 2) //B
+	{
+		return _BV(B_BIT);
+	}
+	else 
+	{
+		return _BV(R_BIT); //R
+	}
+}
+
+void setRGBPWM(uint8_t r, uint8_t g, uint8_t b)
+{
+	R_PWM = r;   
+	G_PWM = g;   
+	B_PWM = b;   
+}
+
+/* ------------------------------------------------------------------------- */
+/* ----------------------------- USB Communication ------------------------- */
+/* ------------------------------------------------------------------------- */
 
 /* usbFunctionRead() is called when the host requests a chunk of data from
 * the device. 
@@ -79,8 +185,11 @@ uchar usbFunctionRead(uchar *data, uchar len)
 {
 	if (reportId == 1)
 	{
-		//Not used
-		return 0;
+		data[0] = 1;
+		data[1] = led[1];
+		data[2] = led[0];
+		data[3] = led[2];
+		return 4;
 	}
 	else if (reportId == 2 || reportId == 3)
 	{
@@ -104,6 +213,61 @@ uchar usbFunctionRead(uchar *data, uchar len)
 
 		return len;
 	}
+	else if (reportId == 4)
+	{
+		data[0] = 4;
+		data[1] = mode;
+		return 2;
+	}
+    else if (reportId == 5)
+    {
+       data[0] = 5;
+       data[1] = 0;
+       data[2] = 0;
+       data[3] = led[1];
+       data[4] = led[0];
+       data[5] = led[2];
+
+       return 6;
+    }
+    else if (reportId >= 6 && reportId <= 9) // Serial data for LEDs
+    {
+       if (bytesRemaining == 0)
+       {
+		   return 0; // end of transfer 
+       }
+
+       if(len > bytesRemaining)
+           len = bytesRemaining;
+
+       //Ignore the first byte of data as it's report id
+       if (currentAddress == 0)
+       {
+          data[0] = reportId;
+          data[1] = 0;
+
+          for (int i = 2; i < len; i++)
+          {
+              data[i] = led[addressOffset + currentAddress + i - 2];
+          }
+
+          currentAddress += len - 2;
+          bytesRemaining -= (len - 1);
+       }
+       else
+       {
+          for (int i = 0; i < len; i++)
+          {
+              data[i] = led[addressOffset + currentAddress + i];
+          }
+
+          currentAddress += len;
+          bytesRemaining -= len;
+       }
+
+       return len;
+    }
+
 	else
 	{
 		return 0;
@@ -118,22 +282,33 @@ uchar usbFunctionWrite(uchar *data, uchar len)
 {
 	if (reportId == 1)
 	{
-		//Only send data if the color has changed
-		if (data[1] != r || data[2] != g || data[3] != b)
+		if (mode == MODE_RGB)
 		{
-			r = data[1];
-			g = data[2];
-			b = data[3];
+			led[0] = data[2];
+			led[1] = data[1];
+			led[2] = data[3];
 
+			//Set PWM values
+			setRGBPWM(255 - led[1], 255 - led[0], 255 - led[2]);
+		}
+		else if (mode == MODE_RGB_INVERSE)
+		{
+			led[0] = data[2];
+			led[1] = data[1];
+			led[2] = data[3];
 
-			uint8_t led[3];
-			
-			led[0]=data[2];
-			led[1]=data[1];
-			led[2]=data[3];
+			//Set PWM values
+			setRGBPWM(led[1], led[0], led[2]);
+		}
+		else if (mode == MODE_WS2812)
+		{
+			led[0] = data[2];
+			led[1] = data[1];
+			led[2] = data[3];
 
+			//Set only the first LED on the first channel
 			cli(); //Disable interrupts
-			ws2812_sendarray_mask(&led[0], 3, _BV(PB1));
+			ws2812_sendarray_mask(&led[0], 3, channelToPin(0));
 			sei(); //Enable interrupts
 		}
 
@@ -159,6 +334,108 @@ uchar usbFunctionWrite(uchar *data, uchar len)
 			eeprom_write_block(data, (uchar *)0 + currentAddress + addressOffset, len);
 			currentAddress += len;
 			bytesRemaining -= len;
+		}
+
+		return bytesRemaining == 0; // return 1 if this was the last chunk 
+	}
+	else if (reportId == 4)
+	{
+		mode = data[1];
+		eeprom_write_byte((uchar *)0 + 1 + 12, mode);
+		//Prepare to send the data simultaneously together with USB polling
+		task = TASK_SET_MODE;
+		delayCycles = 0;
+		
+		//Disable any USB requests while sending data to LED Strip
+		usbDisableAllRequests();
+		return 1;
+	}
+	else if (reportId == 5)
+	{
+		if (mode != MODE_WS2812)
+		{
+			return 1;
+		}
+
+		channel = data[1];
+		uint8_t index = data[2];
+
+		led[index * 3 + 0] = data[4];
+		led[index * 3 + 1] = data[3];
+		led[index * 3 + 2] = data[5];
+
+		//Prepare to send the data simultaneously together with USB polling
+		task = TASK_SEND_DATA;
+		ledCount = (index + 1) * 3;
+		ledIndex = 0;
+		delayCycles = 0;
+		
+		//Disable any USB requests while sending data to LED Strip
+		usbDisableAllRequests();
+
+		return 1;
+	}
+	else if (reportId >= 6 && reportId <= 9) // Serial data for LEDs
+	{
+		if (mode != MODE_WS2812)
+		{
+			return 1;
+		}
+
+		if (bytesRemaining == 0)
+		{
+			if (reportId != 10)
+			{
+				//Prepare to send the data simultaneously together with USB polling
+				task = TASK_SEND_DATA;
+				ledCount = pgm_read_word_near(&ledDataCount[reportId - 6]);
+				ledIndex = 0;
+				delayCycles = 0;
+				
+				//Disable any USB requests while sending data to LED Strip
+				usbDisableAllRequests();
+			}
+
+			return 1; // end of transfer 
+		}
+
+		if(len > bytesRemaining)
+			len = bytesRemaining;
+
+		//Ignore the first byte of data as it's report id
+		if (currentAddress == 0)
+		{
+			channel = data[1];
+
+			for (int i = 2; i < len; i++)
+			{
+				led[addressOffset + currentAddress + i - 2] = data[i];
+			}
+
+			currentAddress += len - 2;
+			bytesRemaining -= (len - 1);
+		}
+		else
+		{
+			for (int i = 0; i < len; i++)
+			{
+				led[addressOffset + currentAddress + i] = data[i];
+			}
+
+			currentAddress += len;
+			bytesRemaining -= len;
+		}
+
+		if (bytesRemaining <= 0 && reportId != 10)
+		{
+			//Prepare to send the data simultaneously together with USB polling
+			task = TASK_SEND_DATA;
+			ledCount = pgm_read_word_near(&ledDataCount[reportId - 6]);
+			ledIndex = 0;
+			delayCycles = 0;
+			
+			//Disable any USB requests while sending data to LED Strip
+			usbDisableAllRequests();
 		}
 
 		return bytesRemaining == 0; // return 1 if this was the last chunk 
@@ -196,74 +473,79 @@ static void SetSerial(void)
 
    for (int i =0; i < SERIAL_NUMBER_LENGTH; i++)
    {
-	serialNumberDescriptor[i +1] = serialNumber[i];
+		serialNumberDescriptor[i +1] = serialNumber[i];
    }
 }
 
+/* Retrieves the current mode from EEPROM */
+static void SetMode(void)
+{
+   mode = eeprom_read_byte((uchar *)0 + 1 + 12);
 
+   if (mode > 2)
+	   mode = 0;
+}
 
-/* ------------------------------------------------------------------------- */
 
 extern "C" usbMsgLen_t usbFunctionSetup(uchar data[8])
 {
 	usbRequest_t    *rq = (usbRequest_t *)data;
 	reportId = rq->wValue.bytes[0];
 
-	/* this code is no longer needed
-    if((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_VENDOR)
-	{
-		switch(rq->bRequest)
-		{
-		case CUSTOM_RQ_SET_RED:
-			r = 255 - rq->wValue.bytes[0];
-			OCR0B = r;
-			break;	
-		case CUSTOM_RQ_SET_GREEN:
-			g = 255 - rq->wValue.bytes[0];
-			OCR0A = g;
-			break;	
-		case CUSTOM_RQ_SET_BLUE:
-			b = 255 - rq->wValue.bytes[0];
-			OCR1B = b;
-			break;	
-		}
-    }
-	else 
-	*/
 	if((rq->bmRequestType & USBRQ_TYPE_MASK) == USBRQ_TYPE_CLASS){ /* HID class request */
         if(rq->bRequest == USBRQ_HID_GET_REPORT){ /* wValue: ReportType (highbyte), ReportID (lowbyte) */
-			 usbMsgPtr = replyBuffer;
-
 			 if(reportId == 1){ //Device colors
-				 
-				replyBuffer[0] = 1; //report id
-				replyBuffer[1] = r; //255 - OCR1B;
-				replyBuffer[2] = g; //255 - OCR0B;
-				replyBuffer[3] = b; //255 - OCR0A;
-
-				return 4;
-				 
+				return USB_NO_MSG;
 			 }
 			 else if(reportId == 2){ // Name of the device
-				 replyBuffer[0] = 2; //report id
-
 				 bytesRemaining = 33;
 				 currentAddress = 0;
 
 				 addressOffset = 32;
 
-				 return USB_NO_MSG; /* use usbFunctionRead() to obtain data */
+				 return USB_NO_MSG; 
 			 }
-			 else if(reportId == 3){ // Name of the device
-				 replyBuffer[0] = 3; //report id
-
+			 else if(reportId == 3){ // Data of the device
 				 bytesRemaining = 33;
 				 currentAddress = 0;
 
 				 addressOffset = 64;
 
-				 return USB_NO_MSG; /* use usbFunctionRead() to obtain data */
+				 return USB_NO_MSG; 
 			 }
+			 else if(reportId == 4){ // Report device mode
+				 return USB_NO_MSG; 
+			 }
+			 else if(reportId == 5){ // Indexed LED data^M
+				 currentAddress = 0;
+				 bytesRemaining = 5;
+
+				 addressOffset = 0;
+				 return USB_NO_MSG; 
+			 }
+			 else if (reportId >= 6 && reportId <= 9) { // Serial data for LEDs
+			 	currentAddress = 0;
+			 	addressOffset = 0;
+
+			 	switch (reportId) {
+			 	    case 6:
+			 	 	   bytesRemaining = MIN_LED_FRAME * 1 + 1;
+			 	 	   break;
+			 	    case 7:
+			 	 	   bytesRemaining = MIN_LED_FRAME * 2 + 1;
+			 	 	   break;
+			 	    case 8:
+			 	 	   bytesRemaining = MIN_LED_FRAME * 4 + 1;
+			 	 	   break;
+			 	    case 9:
+			 	 	   bytesRemaining = MIN_LED_FRAME * 8 + 1;
+			 	 	   break;
+			 	}
+
+
+			 	return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
+			 }
+
 
 			 return 0;
 
@@ -271,21 +553,57 @@ extern "C" usbMsgLen_t usbFunctionSetup(uchar data[8])
 			 if(reportId == 1){ //Device colors
 				bytesRemaining = 3;
 				currentAddress = 0;
-				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
+				return USB_NO_MSG; 
 			 }
 			 else if(reportId == 2){ // Name of the device
 				currentAddress = 0;
 				bytesRemaining = 32;
 
 				addressOffset = 32;
-				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
+				return USB_NO_MSG; 
 			 }
 			 else if(reportId == 3){ // Name of the device
 				currentAddress = 0;
 				bytesRemaining = 32;
 
 				addressOffset = 64;
-				return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
+				return USB_NO_MSG; 
+			 }
+			 else if(reportId == 4){ // Mode
+				currentAddress = 0;
+				bytesRemaining = 1;
+
+				addressOffset = 0;
+				return USB_NO_MSG; 
+			 }
+			 else if(reportId == 5){ // Indexed LED data
+				currentAddress = 0;
+				bytesRemaining = 5;
+
+				addressOffset = 0;
+				return USB_NO_MSG; 
+			 }
+			 else if (reportId >= 6 && reportId <= 9) { // Serial data for LEDs
+				 currentAddress = 0;
+				 addressOffset = 0;
+
+				 switch (reportId) {
+					case 6:
+					    bytesRemaining = MIN_LED_FRAME * 1 + 1;
+					    break;
+					case 7:
+					    bytesRemaining = MIN_LED_FRAME * 2 + 1;
+					    break;
+					case 8:
+					    bytesRemaining = MIN_LED_FRAME * 4 + 1;
+					    break;
+					case 9:
+					    bytesRemaining = MIN_LED_FRAME * 8 + 1;
+					    break;
+				 }
+
+
+				 return USB_NO_MSG; /* use usbFunctionWrite() to receive data from host */
 			 }
 			 return 0;
         }
@@ -358,9 +676,11 @@ int main(void)
 {
 	uchar   i;
 
-    wdt_enable(WDTO_1S);
+	wdt_enable(WDTO_1S);
 
 	SetSerial();
+	//SetMode();
+
     /* Even if you don't use the watchdog, turn it off here. On newer devices,
      * the status of the watchdog (on/off, period) is PRESERVED OVER RESET!
      */
@@ -373,16 +693,16 @@ int main(void)
     usbDeviceDisconnect();  /* enforce re-enumeration, do this while interrupts are disabled! */
     i = 0;
     while(--i){             /* fake USB disconnect for > 250 ms */
-        wdt_reset();
+		wdt_reset();
         _delay_ms(1);
     }
     usbDeviceConnect();
 	
 	DDRB |= _BV(PB1);
 	
-    //LED_PORT_DDR |= _BV(R_BIT);   /* make the LED bit an output */
-    //LED_PORT_DDR |= _BV(G_BIT);   /* make the LED bit an output */
-    //LED_PORT_DDR |= _BV(B_BIT);   /* make the LED bit an output */
+    // LED_PORT_DDR |= _BV(R_BIT);
+    // LED_PORT_DDR |= _BV(G_BIT);
+    // LED_PORT_DDR |= _BV(B_BIT);
 	//pwmInit();
 
 
@@ -397,8 +717,10 @@ int main(void)
     sei();
 
     for(;;){                /* main event loop */
-        wdt_reset();
-        usbPoll();
+		wdt_reset();
+	  	usbPoll();
+
+		//ledTransfer();	
     }
     return 0;
 }
