@@ -8,10 +8,10 @@
  */
 
 #define LED_PORT_DDR        DDRB
-#define LED_PORT_OUTPUT     PORTB
-#define R_BIT            1
-#define G_BIT            0
-#define B_BIT            4
+
+#define R_BIT               PB2
+#define G_BIT               PB1
+#define B_BIT               PB0
 
 #define R_PWM				OCR1B
 #define G_PWM				OCR0B
@@ -35,11 +35,6 @@
 extern "C"
 {
 	#include "usbdrv.h"
-}
-#include "oddebug.h"        /* This is also an example for using debug macros */
-#include "requests.h"       /* The custom request numbers we use */
-extern "C"
-{
 	#include "light_ws2812.h"
 }
 
@@ -130,10 +125,6 @@ const PROGMEM char usbHidReportDescriptor[USB_CFG_HID_REPORT_DESCRIPTOR_LENGTH] 
     0xc0                           // END_COLLECTION
 };
 
-static volatile uint8_t r = 0;
-static volatile uint8_t g = 0;
-static volatile uint8_t b = 0;
-
 static uchar currentAddress;
 static uchar addressOffset;
 static uchar bytesRemaining;
@@ -145,8 +136,6 @@ static uint8_t task = 0;
 static uint16_t ledCount = 0;
 static uint16_t ledIndex = 0;
 static uint16_t delayCycles = 0;
-
-//static uchar replyBuffer[33]; //32 for data + 1 for report id
 
 /* ------------------------------------------------------------------------- */
 /* ----------------------------- Helper Functions--------------------------- */
@@ -652,25 +641,105 @@ extern "C" void usbEventResetReady(void)
     eeprom_write_byte(0, OSCCAL);   // store the calibrated value in EEPROM
 }
 
-/* ------------------------------------------------------------------------- */
-void pwmInit (void)
+void ApplyMode(void)
 {
-    /* PWM enable,  */
-    GTCCR |= _BV(PWM1B) | _BV(COM1B1);
+	if (mode == MODE_RGB || mode == MODE_RGB_INVERSE)
+	{
+		/* PWM enable,  */
+		GTCCR |= _BV(PWM1B) | _BV(COM1B1);
+		TCCR0A |= _BV(WGM00) | _BV(WGM01) | _BV(COM0A1) | _BV(COM0B1);
 
-    TCCR0A |= _BV(WGM00) | _BV(WGM01) | _BV(COM0A1) | _BV(COM0B1);
+		/* Start timer 0 and 1 */
+		TCCR1 |= _BV (CS10);
+		TCCR0B |=  _BV(CS00);
+
+		/* Set PWM value to off after a brief 10ms blink. */
+		if (mode == MODE_RGB)
+		{
+			setRGBPWM(32, 32, 32);
+			_delay_ms(10);
+			setRGBPWM(255, 255, 255);
+		}
+		else
+		{
+			setRGBPWM(223, 223, 223);
+			_delay_ms(10);
+			setRGBPWM(0, 0, 0);
+		}
+	}
+	else if (mode == MODE_WS2812)
+	{
+		//Turn off PWM
+		setRGBPWM(0, 0, 0);
+
+		/* Stop timer 0 and 1 */
+		TCCR1 &= ~_BV (CS10);
+		TCCR0B &=  ~_BV(CS00);
+
+		/* Disable PWM */
+		GTCCR &= ~_BV(PWM1B) & ~_BV(COM1B1);
+		TCCR0A &= ~_BV(WGM00) & ~_BV(WGM01) & ~_BV(COM0A1) & ~_BV(COM0B1);
+
+		led[0]=32; led[1]=32; led[2]=32;
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(0));
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(1));
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(2));
+
+		_delay_ms(10);
+
+		led[0]=0; led[1]=0; led[2]=0;
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(0));
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(1));
+		ws2812_sendarray_mask(&led[0], 3, channelToPin(2));
+	}
+}
 
 
-    /* Start timer 0 and 1 */
-    TCCR1 |= _BV (CS10);
+void ledTransfer() {
 
-    TCCR0B |=  _BV(CS00);
+	if (task != TASK_NONE)
+	{
+		if (delayCycles < DELAY_CYCLES)
+		{
+			delayCycles++;
+			return;
+		}
 
-    /* Set PWM value to 0. */
-    OCR0A = 255;   // PB0
-    OCR0B = 255;   // PB1
-    OCR1B = 255;   // PB4
-} 
+		if (task == TASK_SEND_DATA)
+		{
+			//send all data at the same time, asume there is going to be no communication over USB during this time
+			uint16_t len = 3 * 64;
+
+			if (ledIndex + len >= ledCount)
+			{
+				len = ledCount - ledIndex;
+			}
+
+			cli(); //Disable interrupts
+			ws2812_sendarray_mask(&led[ledIndex], len, channelToPin(channel));
+			sei(); //Enable interrupts
+
+			ledIndex += len;
+
+			if (ledIndex >= ledCount - 1)
+			{
+				task = TASK_NONE;
+				usbEnableAllRequests();
+			}
+		}
+		else if (task == TASK_SET_MODE)
+		{
+			cli(); //Disable interrupts
+			ApplyMode();
+			sei(); //Enable interrupts
+
+			task = TASK_NONE;
+			usbEnableAllRequests();
+		}
+	}
+
+}
+
 
 int main(void)
 {
@@ -679,7 +748,7 @@ int main(void)
 	wdt_enable(WDTO_1S);
 
 	SetSerial();
-	//SetMode();
+	SetMode();
 
     /* Even if you don't use the watchdog, turn it off here. On newer devices,
      * the status of the watchdog (on/off, period) is PRESERVED OVER RESET!
@@ -698,21 +767,12 @@ int main(void)
     }
     usbDeviceConnect();
 	
-	DDRB |= _BV(PB1);
-	
-    // LED_PORT_DDR |= _BV(R_BIT);
-    // LED_PORT_DDR |= _BV(G_BIT);
-    // LED_PORT_DDR |= _BV(B_BIT);
-	//pwmInit();
+	//Set LED ports to output
+    LED_PORT_DDR |= _BV(R_BIT);   
+    LED_PORT_DDR |= _BV(G_BIT);   
+    LED_PORT_DDR |= _BV(B_BIT);   
 
-
-	uint8_t led[3];
-	
-	led[0]=32; led[1]=32; led[2]=32;
-	ws2812_sendarray_mask(&led[0], 3, _BV(PB1));
-    _delay_ms(10);
-	led[0]=0; led[1]=0; led[2]=0;
-	ws2812_sendarray_mask(&led[0], 3, _BV(PB1));
+	ApplyMode();
 
     sei();
 
@@ -720,7 +780,7 @@ int main(void)
 		wdt_reset();
 	  	usbPoll();
 
-		//ledTransfer();	
+		ledTransfer();	
     }
     return 0;
 }

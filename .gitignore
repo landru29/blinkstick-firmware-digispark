@@ -21,3 +21,4 @@
 *.hex
 
 serial.txt
+eeprom.dat
